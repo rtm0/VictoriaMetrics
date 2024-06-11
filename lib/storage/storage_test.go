@@ -8,12 +8,14 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"testing/quick"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
 )
 
@@ -1275,5 +1277,195 @@ func TestStorageSeriesAreNotCreatedOnStaleMarkers(t *testing.T) {
 	s.MustClose()
 	if err := os.RemoveAll(path); err != nil {
 		t.Fatalf("cannot remove %q: %s", path, err)
+	}
+}
+
+func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
+	type options struct {
+		path                  string
+		mrsBatches            [][]MetricRow
+		concurrency           int
+		splitBatches          bool
+		wantTimeseriesCreated int
+		timeRanges            []TimeRange
+		wantCounts            []int
+	}
+	f := func(opts *options) {
+		var failed bool
+		path := fmt.Sprintf("%s_%s", t.Name(), opts.path)
+		s := MustOpenStorage(path, 0, 0, 0)
+
+		testAddConcurrently(s, opts.mrsBatches, opts.concurrency, opts.splitBatches)
+
+		if got, want := s.newTimeseriesCreated.Load(), uint64(opts.wantTimeseriesCreated); got != want {
+			t.Errorf("%s: unexpected s.newTimeseriesCreated value: got %d, want %d", opts.path, got, want)
+			failed = true
+		}
+
+		for i, tr := range opts.timeRanges {
+			want := opts.wantCounts[i]
+			gotNameCount, gotIDCount := testCountAllMetricNamesAndIDs(s, tr)
+			if gotNameCount != want || gotIDCount != want {
+				t.Errorf("%s: %v: unexpected metric name or ID count: got (%d, %d), want (%d, %d)", opts.path, &tr, gotNameCount, gotIDCount, want, want)
+				failed = true
+			}
+		}
+
+		s.MustClose()
+		if !failed {
+			fs.MustRemoveAll(path)
+		}
+	}
+
+	numBatches := 4
+	batches := make([][]MetricRow, numBatches)
+	trs := make([]TimeRange, numBatches)
+	wantCounts := make([]int, numBatches)
+	rng := rand.New(rand.NewSource(1))
+	for i := range numBatches {
+		minTimestamp := time.Date(2024, 1, i+1, 0, 0, 0, 0, time.UTC).UnixMilli()
+		maxTimestamp := time.Date(2024, 1, i+1, 23, 59, 59, 999, time.UTC).UnixMilli()
+		numTimeseries := (i + 1) * 100
+		batches[i] = testGenerateMetricRows(rng, uint64(numTimeseries), minTimestamp, maxTimestamp)
+		trs[i] = TimeRange{minTimestamp, maxTimestamp}
+		wantCounts[i] = numTimeseries
+	}
+	trs = append(trs, TimeRange{trs[0].MinTimestamp, trs[len(trs)-1].MaxTimestamp})
+	wantTimeseriesCreated := len(batches[len(batches)-1])
+	wantCounts = append(wantCounts, wantTimeseriesCreated)
+
+	f(&options{
+		path:                  "SequentialBatches",
+		mrsBatches:            batches,
+		concurrency:           1,
+		splitBatches:          false,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+	})
+	f(&options{
+		path:                  "SequentialBatchesConcurrentRows",
+		mrsBatches:            batches,
+		concurrency:           numBatches,
+		splitBatches:          true,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+	})
+	f(&options{
+		path:                  "ConcurrentBatches",
+		mrsBatches:            batches,
+		concurrency:           numBatches,
+		splitBatches:          false,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+	})
+}
+
+// testAddConcurrently is a test helper function that adds metric rows to the
+// storage concurrently.
+//
+// The function accepts metric rows organized in batches. The number of
+// goroutines is specified with concurrency arg. If splitBatches is false, then
+// each batch is added to the storage in a separate goroutine. Otherwise, rows
+// from a single batch are spread across multiple goroutines and next batch
+// won't be added until all records of the current batch are added.
+func testAddConcurrently(s *Storage, mrsBatches [][]MetricRow, concurrency int, splitBatches bool) {
+	if concurrency < 1 {
+		panic(fmt.Sprintf("Unexpected concurrency: got %d, want >= 1", concurrency))
+	}
+
+	var wg sync.WaitGroup
+	mrsCh := make(chan []MetricRow)
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			for mrs := range mrsCh {
+				if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
+					panic(fmt.Sprintf("AddRows failed unexpectedly: %v", err))
+				}
+			}
+			wg.Done()
+		}()
+	}
+
+	n := 1
+	if splitBatches {
+		n = concurrency
+	}
+	for _, batch := range mrsBatches {
+		step := len(batch) / n
+		if step == 0 {
+			step = 1
+		}
+		for begin := 0; begin < len(batch); begin += step {
+			limit := begin + step
+			if limit > len(batch) {
+				limit = len(batch)
+			}
+			mrsCh <- batch[begin:limit]
+		}
+	}
+	close(mrsCh)
+	wg.Wait()
+	s.DebugFlush()
+}
+
+// testCountMetricNamesAndIDs is a test helper function that counts all time
+// series names and IDs within the timestamp range.
+func testCountAllMetricNamesAndIDs(s *Storage, tr TimeRange) (int, int) {
+	tfsAll := NewTagFilters()
+	if err := tfsAll.Add([]byte("__name__"), []byte(".*"), false, true); err != nil {
+		panic(fmt.Sprintf("unexpected error in TagFilters.Add: %v", err))
+	}
+	names, err := s.SearchMetricNames(nil, []*TagFilters{tfsAll}, tr, 1e9, noDeadline)
+	if err != nil {
+		panic(fmt.Sprintf("SeachMetricNames() failed unexpectedly: %v", err))
+	}
+
+	ids, err := s.idb().searchMetricIDs(nil, []*TagFilters{tfsAll}, tr, 1e9, noDeadline)
+	if err != nil {
+		panic(fmt.Sprintf("seachMetricIDs() failed unexpectedly: %s", err))
+	}
+	return len(names), len(ids)
+}
+
+func TestUniqueMetricIDCache(t *testing.T) {
+	uut := &uniqueMetricIDCache{
+		prev: map[string]uint64{},
+		curr: map[string]uint64{},
+	}
+
+	getOrPut := func(name string, id int) int {
+		return int(uut.getOrPut([]byte(name), uint64(id)))
+	}
+
+	if got, want := getOrPut("m1", 1), 1; got != want {
+		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
+	}
+	if got, want := getOrPut("m2", 2), 2; got != want {
+		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
+	}
+	if got, want := getOrPut("m2", 3), 2; got != want {
+		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
+	}
+	if got, want := getOrPut("m2", 4), 2; got != want {
+		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
+	}
+	// rotate to ensure that metricID is retrieved from prev cache.
+	uut.rotate()
+	if got, want := getOrPut("m2", 5), 2; got != want {
+		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
+	}
+	// rotate again to ensure prev cache is gone.
+	uut.rotate()
+	if got, want := getOrPut("m2", 6), 6; got != want {
+		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
+	}
+	// reset cache to ensure that its entries are gone.
+	uut.reset()
+	if got, want := getOrPut("m2", 7), 7; got != want {
+		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
 	}
 }

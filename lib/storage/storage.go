@@ -97,6 +97,9 @@ type Storage struct {
 	// See generationTSID for details.
 	dateMetricIDCache *dateMetricIDCache
 
+	// uniqueMetricIDCache is MetricName -> MetricID cache.
+	uniqueMetricIDCache *uniqueMetricIDCache
+
 	// Fast cache for MetricID values occurred during the current hour.
 	currHourMetricIDs atomic.Pointer[hourMetricIDs]
 
@@ -217,6 +220,7 @@ func MustOpenStorage(path string, retention time.Duration, maxHourlySeries, maxD
 	s.metricIDCache = s.mustLoadCache("metricID_tsid", mem/16)
 	s.metricNameCache = s.mustLoadCache("metricID_metricName", mem/10)
 	s.dateMetricIDCache = newDateMetricIDCache()
+	s.uniqueMetricIDCache = newUniqueMetricIDCache(1 * time.Second)
 
 	hour := fasttime.UnixHour()
 	hmCurr := s.mustLoadHourMetricIDs(hour, "curr_hour_metric_ids")
@@ -815,6 +819,10 @@ func (s *Storage) mustRotateIndexDB(currentTime time.Time) {
 	// with the updated indexdb generation.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1401
 
+	// Do not flush uniqueMetricIDCache since tsidCache is not flushed.
+	// If tsidCache entries are valid after rotation, then uniqueMetricIDCache
+	// entries are also valid.
+
 	// Flush metric id caches for the current and the previous hour,
 	// since they may contain entries missing in idbCurr after the rotation.
 	// This should prevent from missing data in queries when
@@ -850,6 +858,10 @@ func (s *Storage) resetAndSaveTSIDCache() {
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1347
 	s.tsidCache.Reset()
 	s.mustSaveCache(s.tsidCache, "metricName_tsid")
+}
+
+func (s *Storage) resetUniqueMetricIDCache() {
+	s.uniqueMetricIDCache.reset()
 }
 
 // MustClose closes the storage.
@@ -1264,7 +1276,8 @@ func (s *Storage) DeleteSeries(qt *querytracer.Tracer, tfss []*TagFilters) (int,
 	if err != nil {
 		return deletedCount, fmt.Errorf("cannot delete tsids: %w", err)
 	}
-	// Do not reset MetricName->TSID cache, since it is already reset inside DeleteTSIDs.
+	// Do not reset MetricName->TSID and MetricName->MetricID caches, since they
+	// are already reset inside DeleteTSIDs.
 
 	// Do not reset MetricID->MetricName cache, since it must be used only
 	// after filtering out deleted metricIDs.
@@ -1945,18 +1958,26 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 			continue
 		}
 
-		createAllIndexesForMetricName(is, mn, &genTSID.TSID, date)
-		genTSID.generation = generation
-		s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
-		newSeriesCount++
+		// New time series inserted concurrently may result in duplicate metric
+		// IDs. Deduplicate them to guarantee, that each metric name has one and
+		// only one corresponding metric ID.
+		metricID := s.uniqueMetricIDCache.getOrPut(mr.MetricNameRaw, genTSID.TSID.MetricID)
+		if genTSID.TSID.MetricID == metricID {
+			genTSID.generation = generation
+			s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
+			createAllIndexesForMetricName(is, mn, &genTSID.TSID, date)
+			newSeriesCount++
+			if logNewSeries {
+				logger.Infof("new series created: %s", mn.String())
+			}
+		} else {
+			genTSID.TSID.MetricID = metricID
+		}
 
 		r.TSID = genTSID.TSID
 		prevTSID = r.TSID
 		prevMetricNameRaw = mr.MetricNameRaw
 
-		if logNewSeries {
-			logger.Infof("new series created: %s", mn.String())
-		}
 	}
 
 	s.slowRowInserts.Add(slowInsertsCount)
@@ -2516,6 +2537,72 @@ func (dmm *byDateMetricIDMap) getOrCreate(generation, date uint64) *uint64set.Se
 type byDateMetricIDEntry struct {
 	k generationDateKey
 	v uint64set.Set
+}
+
+// uniqueMetricIDCache is a simple MetricName -> MetricID cache that is used to
+// guarantee the uniqueness of metric IDs when the new time series are inserted
+// concurrently.
+//
+// The cache is emphemeral (i.e. it is not persisted) and its entries are
+// supposed to be evicted quickly by constantly rotating curr and prev maps.
+// The rotation period should be not smaller that the time required to execute
+// the slow path of the Storage.add() for a single row and register the TSID in
+// the main tsidCache. Once this happens, the corresponding record in
+// uniqueMetricIDCache is no longer needed. Thus, setting the rotationPeriod to
+// 1s should be more than enough.
+type uniqueMetricIDCache struct {
+	mu   sync.Mutex
+	prev map[string]uint64
+	curr map[string]uint64
+}
+
+// newUniqueMetricIDCache creates a new MetricName -> MetricID cache with
+// rotation period.
+func newUniqueMetricIDCache(rotationPeriod time.Duration) *uniqueMetricIDCache {
+	c := uniqueMetricIDCache{
+		prev: map[string]uint64{},
+		curr: map[string]uint64{},
+	}
+	go func() {
+		for {
+			time.Sleep(rotationPeriod)
+			c.rotate()
+		}
+	}()
+	return &c
+}
+
+// rotate drops all cache entries older than the rotation period.
+func (c *uniqueMetricIDCache) rotate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.prev = c.curr
+	c.curr = map[string]uint64{}
+}
+
+// reset drops all cache entries at once.
+func (c *uniqueMetricIDCache) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.prev = map[string]uint64{}
+	c.curr = map[string]uint64{}
+}
+
+// getOrPut returns the existing metricID for the metricName if present.
+// Otherwise, it stores and returns the given metricID.
+func (c *uniqueMetricIDCache) getOrPut(metricName []byte, metricID uint64) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if v, found := c.curr[string(metricName)]; found {
+		return v
+	}
+	if v, found := c.prev[string(metricName)]; found {
+		return v
+	}
+
+	c.curr[string(metricName)] = metricID
+	return metricID
 }
 
 func (s *Storage) updateNextDayMetricIDs(date uint64) {

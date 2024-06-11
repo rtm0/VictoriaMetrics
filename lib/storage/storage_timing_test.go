@@ -2,9 +2,12 @@ package storage
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"sync/atomic"
 	"testing"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 )
 
 func BenchmarkStorageAddRows(b *testing.B) {
@@ -52,4 +55,41 @@ func benchmarkStorageAddRows(b *testing.B, rowsPerBatch int) {
 		}
 	})
 	b.StopTimer()
+}
+
+func BenchmarkStorageAddHistoricalRowsConcurrently(b *testing.B) {
+	defer fs.MustRemoveAll(b.Name())
+
+	numBatches := 100
+	numRowsPerBatch := 1000
+	numRowsTotal := numBatches * numRowsPerBatch
+	mrsBatches := make([][]MetricRow, numBatches)
+	rng := rand.New(rand.NewSource(1))
+	for batch := range numBatches {
+		mrsBatches[batch] = testGenerateMetricRows(rng, uint64(numRowsPerBatch), int64(batch*1000), int64((batch+1)*1000-1))
+	}
+	tr := TimeRange{int64(0), int64(numBatches * numRowsPerBatch)}
+
+	for _, concurrency := range []int{1, 2, 4, 8, 16, 32} {
+		b.Run(fmt.Sprintf("%d", concurrency), func(b *testing.B) {
+			var rowsAdded, slowInserts, nameCnt, idCnt int
+			for range b.N {
+				path := b.Name()
+				fs.MustRemoveAll(path)
+				s := MustOpenStorage(path, 0, 0, 0)
+				testAddConcurrently(s, mrsBatches, concurrency, false)
+
+				rowsAdded = numRowsTotal
+				slowInserts = int(s.slowRowInserts.Load())
+				nameCnt, idCnt = testCountAllMetricNamesAndIDs(s, tr)
+
+				s.MustClose()
+			}
+
+			b.ReportMetric(float64(slowInserts), "slow-inserts")
+			b.ReportMetric(float64(nameCnt), "ts-names")
+			b.ReportMetric(float64(idCnt), "ts-ids")
+			b.ReportMetric(float64(rowsAdded)/float64(b.Elapsed().Seconds()), "rows/s")
+		})
+	}
 }
