@@ -819,9 +819,8 @@ func (s *Storage) mustRotateIndexDB(currentTime time.Time) {
 	// with the updated indexdb generation.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1401
 
-	// Do not flush uniqueMetricIDCache since tsidCache is not flushed.
-	// If tsidCache entries are valid after rotation, then uniqueMetricIDCache
-	// entries are also valid.
+	// Do not flush uniqueMetricIDCache since metricIDs do not change after
+	// indexdb rotation.
 
 	// Flush metric id caches for the current and the previous hour,
 	// since they may contain entries missing in idbCurr after the rotation.
@@ -1696,6 +1695,7 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 	defer PutMetricName(mn)
 
 	var seriesRepopulated uint64
+	var newSeriesCount uint64
 
 	idb := s.idb()
 	generation := idb.generation
@@ -1767,21 +1767,13 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 		}
 
 		// Slowest path - there is no TSID in indexdb for the given mr.MetricNameRaw. Create it.
-		generateTSID(&genTSID.TSID, mn)
-
-		if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
-			// Skip the row, since it exceeds the configured cardinality limit.
+		if !s.generateUniqueTSID(&genTSID, mn, mr, is, generation, date, &newSeriesCount) {
 			continue
 		}
-
-		// Schedule creating TSID indexes instead of creating them synchronously.
-		// This should keep stable the ingestion rate when new time series are ingested.
-		createAllIndexesForMetricName(is, mn, &genTSID.TSID, date)
-		genTSID.generation = generation
-		s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
 	}
 
 	s.timeseriesRepopulated.Add(seriesRepopulated)
+	s.newTimeseriesCreated.Add(newSeriesCount)
 
 	// There is no need in pre-filling idbNext here, since RegisterMetricNames() is rarely called.
 	// So it is OK to register metric names in blocking manner after indexdb rotation.
@@ -1950,28 +1942,9 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 		}
 
 		// Slowest path - the TSID for the given mr.MetricNameRaw isn't found in indexdb. Create it.
-		generateTSID(&genTSID.TSID, mn)
-
-		if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
-			// Skip the row, since it exceeds the configured cardinality limit.
+		if !s.generateUniqueTSID(&genTSID, mn, mr, is, generation, date, &newSeriesCount) {
 			j--
 			continue
-		}
-
-		// New time series inserted concurrently may result in duplicate metric
-		// IDs. Deduplicate them to guarantee, that each metric name has one and
-		// only one corresponding metric ID.
-		metricID := s.uniqueMetricIDCache.getOrPut(mr.MetricNameRaw, genTSID.TSID.MetricID)
-		if genTSID.TSID.MetricID == metricID {
-			genTSID.generation = generation
-			s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
-			createAllIndexesForMetricName(is, mn, &genTSID.TSID, date)
-			newSeriesCount++
-			if logNewSeries {
-				logger.Infof("new series created: %s", mn.String())
-			}
-		} else {
-			genTSID.TSID.MetricID = metricID
 		}
 
 		r.TSID = genTSID.TSID
@@ -2006,6 +1979,33 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 		return fmt.Errorf("error occurred during rows addition: %w", err)
 	}
 	return nil
+}
+
+func (s *Storage) generateUniqueTSID(genTSID *generationTSID, mn *MetricName, mr *MetricRow, is *indexSearch, generation, date uint64, newSeriesCount *uint64) bool {
+	generateTSID(&genTSID.TSID, mn)
+
+	if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
+		// Skip the row, since it exceeds the configured cardinality limit.
+		return false
+	}
+
+	// New time series inserted concurrently may result in duplicate metric
+	// IDs. Deduplicate them to guarantee, that each metric name has one and
+	// only one corresponding metric ID.
+	metricID := s.uniqueMetricIDCache.getOrPut(mr.MetricNameRaw, genTSID.TSID.MetricID)
+	if genTSID.TSID.MetricID == metricID {
+		genTSID.generation = generation
+		s.putSeriesToCache(mr.MetricNameRaw, genTSID, date)
+		createAllIndexesForMetricName(is, mn, &genTSID.TSID, date)
+		*newSeriesCount++
+		if logNewSeries {
+			logger.Infof("new series created: %s", mn.String())
+		}
+	} else {
+		genTSID.TSID.MetricID = metricID
+	}
+
+	return true
 }
 
 var storageAddRowsLogger = logger.WithThrottler("storageAddRows", 5*time.Second)

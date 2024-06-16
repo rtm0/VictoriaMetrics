@@ -70,6 +70,12 @@ func BenchmarkStorageAddHistoricalRowsConcurrently(b *testing.B) {
 	}
 	tr := TimeRange{int64(0), int64(numBatches * numRowsPerBatch)}
 
+	addRows := func(s *Storage, mrs []MetricRow) {
+		if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
+			panic(fmt.Sprintf("AddRows() failed unexpectedly: %v", err))
+		}
+	}
+
 	for _, concurrency := range []int{1, 2, 4, 8, 16, 32} {
 		b.Run(fmt.Sprintf("%d", concurrency), func(b *testing.B) {
 			var rowsAdded, slowInserts, nameCnt, idCnt int
@@ -77,7 +83,10 @@ func BenchmarkStorageAddHistoricalRowsConcurrently(b *testing.B) {
 				path := b.Name()
 				fs.MustRemoveAll(path)
 				s := MustOpenStorage(path, 0, 0, 0)
-				testAddConcurrently(s, mrsBatches, concurrency, false)
+
+				testDoConcurrently(s, addRows, mrsBatches, concurrency, false)
+
+				s.DebugFlush()
 
 				rowsAdded = numRowsTotal
 				slowInserts = int(s.slowRowInserts.Load())
@@ -87,8 +96,8 @@ func BenchmarkStorageAddHistoricalRowsConcurrently(b *testing.B) {
 			}
 
 			b.ReportMetric(float64(slowInserts), "slow-inserts")
-			b.ReportMetric(float64(nameCnt), "ts-names")
-			b.ReportMetric(float64(idCnt), "ts-ids")
+			b.ReportMetric(float64(nameCnt), "metric-names")
+			b.ReportMetric(float64(idCnt), "TSIDs")
 			b.ReportMetric(float64(rowsAdded)/float64(b.Elapsed().Seconds()), "rows/s")
 		})
 	}

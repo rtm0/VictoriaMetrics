@@ -1281,7 +1281,17 @@ func TestStorageSeriesAreNotCreatedOnStaleMarkers(t *testing.T) {
 }
 
 func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
+	registerMetricNames := func(s *Storage, mrs []MetricRow) {
+		s.RegisterMetricNames(nil, mrs)
+	}
+	addRows := func(s *Storage, mrs []MetricRow) {
+		if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
+			panic(fmt.Sprintf("AddRows() failed unexpectedly: %v", err))
+		}
+	}
+
 	type options struct {
+		op                    func(s *Storage, mrs []MetricRow)
 		path                  string
 		mrsBatches            [][]MetricRow
 		concurrency           int
@@ -1295,7 +1305,9 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		path := fmt.Sprintf("%s_%s", t.Name(), opts.path)
 		s := MustOpenStorage(path, 0, 0, 0)
 
-		testAddConcurrently(s, opts.mrsBatches, opts.concurrency, opts.splitBatches)
+		testDoConcurrently(s, opts.op, opts.mrsBatches, opts.concurrency, opts.splitBatches)
+
+		s.DebugFlush()
 
 		if got, want := s.newTimeseriesCreated.Load(), uint64(opts.wantTimeseriesCreated); got != want {
 			t.Errorf("%s: unexpected s.newTimeseriesCreated value: got %d, want %d", opts.path, got, want)
@@ -1335,7 +1347,8 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 	wantCounts = append(wantCounts, wantTimeseriesCreated)
 
 	f(&options{
-		path:                  "SequentialBatches",
+		op:                    addRows,
+		path:                  "AddRows_SequentialBatches",
 		mrsBatches:            batches,
 		concurrency:           1,
 		splitBatches:          false,
@@ -1344,7 +1357,8 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 	})
 	f(&options{
-		path:                  "SequentialBatchesConcurrentRows",
+		op:                    addRows,
+		path:                  "AddRows_SequentialBatchesConcurrentRows",
 		mrsBatches:            batches,
 		concurrency:           numBatches,
 		splitBatches:          true,
@@ -1353,7 +1367,8 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 	})
 	f(&options{
-		path:                  "ConcurrentBatches",
+		op:                    addRows,
+		path:                  "AddRows_ConcurrentBatches",
 		mrsBatches:            batches,
 		concurrency:           numBatches,
 		splitBatches:          false,
@@ -1361,17 +1376,47 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		timeRanges:            trs,
 		wantCounts:            wantCounts,
 	})
+	// For RegisterMetricNames tests, we only check the number of new
+	// timeseries created because s.SearchMetricNames() and
+	// s.idb().searchMetricIDs() return incorrect numbers since
+	// RegisterMetricNames() does not create per-date indexes for all dates for
+	// a given timeseries.
+	f(&options{
+		op:                    registerMetricNames,
+		path:                  "RegisterMetricNames_SequentialBatches",
+		mrsBatches:            batches,
+		concurrency:           1,
+		splitBatches:          false,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+	})
+	f(&options{
+		op:                    registerMetricNames,
+		path:                  "RegisterMetricNames_SequentialBatchesConcurrentRows",
+		mrsBatches:            batches,
+		concurrency:           numBatches,
+		splitBatches:          true,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+	})
+	f(&options{
+		op:                    registerMetricNames,
+		path:                  "RegisterMetricNames_ConcurrentBatches",
+		mrsBatches:            batches,
+		concurrency:           numBatches,
+		splitBatches:          false,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+	})
+
 }
 
-// testAddConcurrently is a test helper function that adds metric rows to the
-// storage concurrently.
+// testDoConcurrently is a test helper function that performs some operation on
+// metric rows concurrently.
 //
 // The function accepts metric rows organized in batches. The number of
 // goroutines is specified with concurrency arg. If splitBatches is false, then
-// each batch is added to the storage in a separate goroutine. Otherwise, rows
-// from a single batch are spread across multiple goroutines and next batch
-// won't be added until all records of the current batch are added.
-func testAddConcurrently(s *Storage, mrsBatches [][]MetricRow, concurrency int, splitBatches bool) {
+// each batch is processed in a separate goroutine. Otherwise, rows from a
+// single batch are spread across multiple goroutines and next batch won't be
+// processed until all records of the current batch are processed.
+func testDoConcurrently(s *Storage, op func(s *Storage, mrs []MetricRow), mrsBatches [][]MetricRow, concurrency int, splitBatches bool) {
 	if concurrency < 1 {
 		panic(fmt.Sprintf("Unexpected concurrency: got %d, want >= 1", concurrency))
 	}
@@ -1382,9 +1427,7 @@ func testAddConcurrently(s *Storage, mrsBatches [][]MetricRow, concurrency int, 
 		wg.Add(1)
 		go func() {
 			for mrs := range mrsCh {
-				if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
-					panic(fmt.Sprintf("AddRows failed unexpectedly: %v", err))
-				}
+				op(s, mrs)
 			}
 			wg.Done()
 		}()
@@ -1409,7 +1452,6 @@ func testAddConcurrently(s *Storage, mrsBatches [][]MetricRow, concurrency int, 
 	}
 	close(mrsCh)
 	wg.Wait()
-	s.DebugFlush()
 }
 
 // testCountMetricNamesAndIDs is a test helper function that counts all time
