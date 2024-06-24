@@ -1290,6 +1290,10 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		}
 	}
 
+	type dateCount struct {
+		date  uint64
+		count int
+	}
 	type options struct {
 		op                    func(s *Storage, mrs []MetricRow)
 		path                  string
@@ -1299,6 +1303,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantTimeseriesCreated int
 		timeRanges            []TimeRange
 		wantCounts            []int
+		wantTotalSeries       []*dateCount
 	}
 	f := func(opts *options) {
 		var failed bool
@@ -1323,6 +1328,18 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 			}
 		}
 
+		for _, wtc := range opts.wantTotalSeries {
+			date := wtc.date
+			dt := time.Unix(int64(date)*24*3600, 0).UTC()
+			status, err := s.GetTSDBStatus(nil, nil, date, "", 10, 1e6, noDeadline)
+			if err != nil {
+				t.Fatalf("%s: GetTSDBStatus(%v) failed unexpectedly: %v", opts.path, dt, err)
+			}
+			if got, want := status.TotalSeries, uint64(wtc.count); got != want {
+				t.Errorf("%s: %v: unexpected TSDBStatus.TotalSeries: got %d, want %d", opts.path, dt, got, want)
+			}
+		}
+
 		s.MustClose()
 		if !failed {
 			fs.MustRemoveAll(path)
@@ -1333,6 +1350,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 	batches := make([][]MetricRow, numBatches)
 	trs := make([]TimeRange, numBatches)
 	wantCounts := make([]int, numBatches)
+	wantTotalSeries := make([]*dateCount, numBatches)
 	rng := rand.New(rand.NewSource(1))
 	for i := range numBatches {
 		minTimestamp := time.Date(2024, 1, i+1, 0, 0, 0, 0, time.UTC).UnixMilli()
@@ -1341,6 +1359,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		batches[i] = testGenerateMetricRows(rng, uint64(numTimeseries), minTimestamp, maxTimestamp)
 		trs[i] = TimeRange{minTimestamp, maxTimestamp}
 		wantCounts[i] = numTimeseries
+		wantTotalSeries[i] = &dateCount{uint64(minTimestamp / (24 * 3600 * 1000)), numTimeseries}
 	}
 	trs = append(trs, TimeRange{trs[0].MinTimestamp, trs[len(trs)-1].MaxTimestamp})
 	wantTimeseriesCreated := len(batches[len(batches)-1])
@@ -1348,33 +1367,36 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 
 	f(&options{
 		op:                    addRows,
-		path:                  "AddRows_SequentialBatches",
+		path:                  "DifferentDates_AddRows_SequentialBatches",
 		mrsBatches:            batches,
 		concurrency:           1,
 		splitBatches:          false,
 		wantTimeseriesCreated: wantTimeseriesCreated,
 		timeRanges:            trs,
 		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
 	})
 	f(&options{
 		op:                    addRows,
-		path:                  "AddRows_SequentialBatchesConcurrentRows",
+		path:                  "DifferentDates_AddRows_SequentialBatchesConcurrentRows",
 		mrsBatches:            batches,
 		concurrency:           numBatches,
 		splitBatches:          true,
 		wantTimeseriesCreated: wantTimeseriesCreated,
 		timeRanges:            trs,
 		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
 	})
 	f(&options{
 		op:                    addRows,
-		path:                  "AddRows_ConcurrentBatches",
+		path:                  "DifferentDates_AddRows_ConcurrentBatches",
 		mrsBatches:            batches,
 		concurrency:           numBatches,
 		splitBatches:          false,
 		wantTimeseriesCreated: wantTimeseriesCreated,
 		timeRanges:            trs,
 		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
 	})
 	// For RegisterMetricNames tests, we only check the number of new
 	// timeseries created because s.SearchMetricNames() and
@@ -1383,7 +1405,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 	// a given timeseries.
 	f(&options{
 		op:                    registerMetricNames,
-		path:                  "RegisterMetricNames_SequentialBatches",
+		path:                  "DifferentDates_RegisterMetricNames_SequentialBatches",
 		mrsBatches:            batches,
 		concurrency:           1,
 		splitBatches:          false,
@@ -1391,7 +1413,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 	})
 	f(&options{
 		op:                    registerMetricNames,
-		path:                  "RegisterMetricNames_SequentialBatchesConcurrentRows",
+		path:                  "DifferentDates_RegisterMetricNames_SequentialBatchesConcurrentRows",
 		mrsBatches:            batches,
 		concurrency:           numBatches,
 		splitBatches:          true,
@@ -1399,7 +1421,84 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 	})
 	f(&options{
 		op:                    registerMetricNames,
-		path:                  "RegisterMetricNames_ConcurrentBatches",
+		path:                  "DifferentDates_RegisterMetricNames_ConcurrentBatches",
+		mrsBatches:            batches,
+		concurrency:           numBatches,
+		splitBatches:          false,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+	})
+
+	numBatches = 4
+	batches = make([][]MetricRow, numBatches)
+	trs = make([]TimeRange, numBatches)
+	wantCounts = make([]int, numBatches)
+	wantTotalSeries = make([]*dateCount, numBatches)
+	rng = rand.New(rand.NewSource(1))
+	for i := range numBatches {
+		minTimestamp := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+		maxTimestamp := time.Date(2024, 1, 1, 23, 59, 59, 999, time.UTC).UnixMilli()
+		numTimeseries := 100
+		batches[i] = testGenerateMetricRows(rng, uint64(numTimeseries), minTimestamp, maxTimestamp)
+		trs[i] = TimeRange{minTimestamp, maxTimestamp}
+		wantCounts[i] = numTimeseries
+		wantTotalSeries[i] = &dateCount{uint64(minTimestamp / (24 * 3600 * 1000)), numTimeseries}
+	}
+	trs = append(trs, TimeRange{trs[0].MinTimestamp, trs[len(trs)-1].MaxTimestamp})
+	wantTimeseriesCreated = len(batches[len(batches)-1])
+	wantCounts = append(wantCounts, wantTimeseriesCreated)
+
+	f(&options{
+		op:                    addRows,
+		path:                  "SameDate_AddRows_SequentialBatches",
+		mrsBatches:            batches,
+		concurrency:           1,
+		splitBatches:          false,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
+	})
+	f(&options{
+		op:                    addRows,
+		path:                  "SameDate_AddRows_SequentialBatchesConcurrentRows",
+		mrsBatches:            batches,
+		concurrency:           numBatches,
+		splitBatches:          true,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
+	})
+	f(&options{
+		op:                    addRows,
+		path:                  "SameDate_AddRows_ConcurrentBatches",
+		mrsBatches:            batches,
+		concurrency:           numBatches,
+		splitBatches:          false,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
+	})
+	f(&options{
+		op:                    registerMetricNames,
+		path:                  "SameDate_RegisterMetricNames_SequentialBatches",
+		mrsBatches:            batches,
+		concurrency:           1,
+		splitBatches:          false,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+	})
+	f(&options{
+		op:                    registerMetricNames,
+		path:                  "SameDate_RegisterMetricNames_SequentialBatchesConcurrentRows",
+		mrsBatches:            batches,
+		concurrency:           numBatches,
+		splitBatches:          true,
+		wantTimeseriesCreated: wantTimeseriesCreated,
+	})
+	f(&options{
+		op:                    registerMetricNames,
+		path:                  "SameDate_RegisterMetricNames_ConcurrentBatches",
 		mrsBatches:            batches,
 		concurrency:           numBatches,
 		splitBatches:          false,
@@ -1474,40 +1573,59 @@ func testCountAllMetricNamesAndIDs(s *Storage, tr TimeRange) (int, int) {
 }
 
 func TestUniqueMetricIDCache(t *testing.T) {
+	assertMetricID := func(t *testing.T, got, want uint64) {
+		t.Helper()
+		if got != want {
+			t.Fatalf("unexpected metricID: got %d, want %d", got, want)
+		}
+	}
+
+	assertHasDate := func(t *testing.T, got, want bool) {
+		t.Helper()
+		if got != want {
+			t.Fatalf("unexpected hasDate: got %t, want %t", got, want)
+		}
+	}
+
 	uut := &uniqueMetricIDCache{
-		prev: map[string]uint64{},
-		curr: map[string]uint64{},
+		prev: map[string]*metricIDWithDates{},
+		curr: map[string]*metricIDWithDates{},
 	}
 
-	getOrPut := func(name string, id int) int {
-		return int(uut.getOrPut([]byte(name), uint64(id)))
-	}
+	gotID, gotHasDate := uut.getOrPut([]byte("m1"), 1, 100)
+	assertMetricID(t, gotID, 1)
+	assertHasDate(t, gotHasDate, false)
 
-	if got, want := getOrPut("m1", 1), 1; got != want {
-		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
-	}
-	if got, want := getOrPut("m2", 2), 2; got != want {
-		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
-	}
-	if got, want := getOrPut("m2", 3), 2; got != want {
-		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
-	}
-	if got, want := getOrPut("m2", 4), 2; got != want {
-		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
-	}
+	gotID, gotHasDate = uut.getOrPut([]byte("m2"), 2, 100)
+	assertMetricID(t, gotID, 2)
+	assertHasDate(t, gotHasDate, false)
+
+	gotID, gotHasDate = uut.getOrPut([]byte("m2"), 3, 100)
+	assertMetricID(t, gotID, 2)
+	assertHasDate(t, gotHasDate, true)
+
+	gotID, gotHasDate = uut.getOrPut([]byte("m2"), 3, 200)
+	assertMetricID(t, gotID, 2)
+	assertHasDate(t, gotHasDate, false)
+
 	// rotate to ensure that metricID is retrieved from prev cache.
 	uut.rotate()
-	if got, want := getOrPut("m2", 5), 2; got != want {
-		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
-	}
+
+	gotID, gotHasDate = uut.getOrPut([]byte("m2"), 4, 200)
+	assertMetricID(t, gotID, 2)
+	assertHasDate(t, gotHasDate, true)
+
 	// rotate again to ensure prev cache is gone.
 	uut.rotate()
-	if got, want := getOrPut("m2", 6), 6; got != want {
-		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
-	}
+
+	gotID, gotHasDate = uut.getOrPut([]byte("m2"), 6, 200)
+	assertMetricID(t, gotID, 6)
+	assertHasDate(t, gotHasDate, false)
+
 	// reset cache to ensure that its entries are gone.
 	uut.reset()
-	if got, want := getOrPut("m2", 7), 7; got != want {
-		t.Fatalf("unexpected metricID: got %d, want %d", got, want)
-	}
+
+	gotID, gotHasDate = uut.getOrPut([]byte("m2"), 7, 200)
+	assertMetricID(t, gotID, 7)
+	assertHasDate(t, gotHasDate, false)
 }

@@ -1983,6 +1983,7 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 
 func (s *Storage) generateUniqueTSID(genTSID *generationTSID, mn *MetricName, mr *MetricRow, is *indexSearch, generation, date uint64, newSeriesCount *uint64) bool {
 	generateTSID(&genTSID.TSID, mn)
+	genTSID.generation = generation
 
 	if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
 		// Skip the row, since it exceeds the configured cardinality limit.
@@ -1992,17 +1993,27 @@ func (s *Storage) generateUniqueTSID(genTSID *generationTSID, mn *MetricName, mr
 	// New time series inserted concurrently may result in duplicate metric
 	// IDs. Deduplicate them to guarantee, that each metric name has one and
 	// only one corresponding metric ID.
-	metricID := s.uniqueMetricIDCache.getOrPut(mr.MetricNameRaw, genTSID.TSID.MetricID)
-	if genTSID.TSID.MetricID == metricID {
-		genTSID.generation = generation
-		s.putSeriesToCache(mr.MetricNameRaw, genTSID, date)
-		createAllIndexesForMetricName(is, mn, &genTSID.TSID, date)
+	metricID, hasDate := s.uniqueMetricIDCache.getOrPut(mr.MetricNameRaw, genTSID.TSID.MetricID, date)
+	needCreatePerDayIndex := !hasDate
+	needCreateGlobalIndex := genTSID.TSID.MetricID == metricID
+	genTSID.TSID.MetricID = metricID
+
+	// Unconditionally add the entry to the Date -> MetricID cache to avoid
+	// duplicates in per-date index. If the entry is not in the index it will
+	// be added by the code below.
+	s.dateMetricIDCache.Set(generation, date, metricID)
+
+	if needCreatePerDayIndex {
+		is.createPerDayIndexes(date, &genTSID.TSID, mn)
+	}
+
+	if needCreateGlobalIndex {
+		s.putTSIDToCache(genTSID, mr.MetricNameRaw)
+		is.createGlobalIndexes(&genTSID.TSID, mn)
 		*newSeriesCount++
 		if logNewSeries {
 			logger.Infof("new series created: %s", mn.String())
 		}
-	} else {
-		genTSID.TSID.MetricID = metricID
 	}
 
 	return true
@@ -2025,13 +2036,13 @@ func createAllIndexesForMetricName(is *indexSearch, mn *MetricName, tsid *TSID, 
 }
 
 func (s *Storage) putSeriesToCache(metricNameRaw []byte, genTSID *generationTSID, date uint64) {
-	// Store the TSID for the current indexdb into cache,
-	// so future rows for that TSID are ingested via fast path.
-	s.putTSIDToCache(genTSID, metricNameRaw)
-
 	// Register the (generation, date, metricID) entry in the cache,
 	// so next time the entry is found there instead of searching for it in the indexdb.
 	s.dateMetricIDCache.Set(genTSID.generation, date, genTSID.TSID.MetricID)
+
+	// Store the TSID for the current indexdb into cache,
+	// so future rows for that TSID are ingested via fast path.
+	s.putTSIDToCache(genTSID, metricNameRaw)
 }
 
 func (s *Storage) registerSeriesCardinality(metricID uint64, metricNameRaw []byte) bool {
@@ -2359,6 +2370,14 @@ func (dmc *dateMetricIDCache) Has(generation, date, metricID uint64) bool {
 
 	// Slow path. Check mutable map.
 	dmc.mu.Lock()
+
+	byDate = dmc.byDate.Load()
+	v = byDate.get(generation, date)
+	if v.Has(metricID) {
+		dmc.mu.Unlock()
+		return true
+	}
+
 	vMutable := dmc.byDateMutable.get(generation, date)
 	ok := vMutable.Has(metricID)
 	if ok {
@@ -2539,9 +2558,9 @@ type byDateMetricIDEntry struct {
 	v uint64set.Set
 }
 
-// uniqueMetricIDCache is a simple MetricName -> MetricID cache that is used to
-// guarantee the uniqueness of metric IDs when the new time series are inserted
-// concurrently.
+// uniqueMetricIDCache is a simple MetricName -> (MetricID, set(Date)) cache
+// that is used to guarantee the uniqueness of metric IDs when the new time
+// series are inserted concurrently.
 //
 // The cache is emphemeral (i.e. it is not persisted) and its entries are
 // supposed to be evicted quickly by constantly rotating curr and prev maps.
@@ -2552,16 +2571,21 @@ type byDateMetricIDEntry struct {
 // 1s should be more than enough.
 type uniqueMetricIDCache struct {
 	mu   sync.Mutex
-	prev map[string]uint64
-	curr map[string]uint64
+	prev map[string]*metricIDWithDates
+	curr map[string]*metricIDWithDates
 }
 
-// newUniqueMetricIDCache creates a new MetricName -> MetricID cache with
-// rotation period.
+type metricIDWithDates struct {
+	metricID uint64
+	dates    map[uint64]bool
+}
+
+// newUniqueMetricIDCache creates a new MetricName -> (MetricID, set(Date))
+// cache with rotation period.
 func newUniqueMetricIDCache(rotationPeriod time.Duration) *uniqueMetricIDCache {
 	c := uniqueMetricIDCache{
-		prev: map[string]uint64{},
-		curr: map[string]uint64{},
+		prev: map[string]*metricIDWithDates{},
+		curr: map[string]*metricIDWithDates{},
 	}
 	go func() {
 		for {
@@ -2577,32 +2601,41 @@ func (c *uniqueMetricIDCache) rotate() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.prev = c.curr
-	c.curr = map[string]uint64{}
+	c.curr = map[string]*metricIDWithDates{}
 }
 
 // reset drops all cache entries at once.
 func (c *uniqueMetricIDCache) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.prev = map[string]uint64{}
-	c.curr = map[string]uint64{}
+	c.prev = map[string]*metricIDWithDates{}
+	c.curr = map[string]*metricIDWithDates{}
 }
 
-// getOrPut returns the existing metricID for the metricName if present.
-// Otherwise, it stores and returns the given metricID.
-func (c *uniqueMetricIDCache) getOrPut(metricName []byte, metricID uint64) uint64 {
+// getOrPut returns the existing metricID for the metricName if present. It also
+// returns true if the date set for that metricName contains the supplied date.
+// Otherwise, it stores and returns the given metricID and returns false if the
+// date is not in the date set.
+func (c *uniqueMetricIDCache) getOrPut(metricName []byte, metricID, date uint64) (uint64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if v, found := c.curr[string(metricName)]; found {
-		return v
+	v, found := c.curr[string(metricName)]
+	if !found {
+		v, found = c.prev[string(metricName)]
 	}
-	if v, found := c.prev[string(metricName)]; found {
-		return v
+	if found {
+		hasDate := v.dates[date]
+		if !hasDate {
+			v.dates[date] = true
+		}
+		return v.metricID, hasDate
 	}
 
-	c.curr[string(metricName)] = metricID
-	return metricID
+	dates := make(map[uint64]bool)
+	dates[date] = true
+	c.curr[string(metricName)] = &metricIDWithDates{metricID, dates}
+	return metricID, false
 }
 
 func (s *Storage) updateNextDayMetricIDs(date uint64) {
