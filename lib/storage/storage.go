@@ -1706,11 +1706,14 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 		mr := &mrs[i]
 		date := uint64(mr.Timestamp) / msecPerDay
 		if s.getTSIDFromCache(&genTSID, mr.MetricNameRaw) {
+			metricID := genTSID.TSID.MetricID
+
 			// Fast path - mr.MetricNameRaw has been already registered in the current idb.
-			if !s.registerSeriesCardinality(genTSID.TSID.MetricID, mr.MetricNameRaw) {
+			if !s.registerSeriesCardinality(metricID, mr.MetricNameRaw) {
 				// Skip row, since it exceeds cardinality limit
 				continue
 			}
+
 			if genTSID.generation < generation {
 				// The found TSID is from the previous indexdb. Create it in the current indexdb.
 
@@ -1729,7 +1732,22 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 				genTSID.generation = generation
 				s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
 				seriesRepopulated++
+			} else if !s.dateMetricIDCache.Has(generation, date, metricID) && !is.hasDateMetricIDNoExtDB(date, metricID) {
+				if err := mn.UnmarshalRaw(mr.MetricNameRaw); err != nil {
+					// Do not stop adding rows on error - just skip invalid row.
+					// This guarantees that invalid rows don't prevent
+					// from adding valid rows into the storage.
+					if firstWarn == nil {
+						firstWarn = fmt.Errorf("cannot umarshal MetricNameRaw %q: %w", mr.MetricNameRaw, err)
+					}
+					continue
+				}
+				mn.sortTags()
+
+				is.createPerDayIndexes(date, &genTSID.TSID, mn)
+				s.dateMetricIDCache.Set(generation, date, metricID)
 			}
+
 			continue
 		}
 

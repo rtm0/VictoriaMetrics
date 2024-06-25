@@ -1398,11 +1398,6 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	// For RegisterMetricNames tests, we only check the number of new
-	// timeseries created because s.SearchMetricNames() and
-	// s.idb().searchMetricIDs() return incorrect numbers since
-	// RegisterMetricNames() does not create per-date indexes for all dates for
-	// a given timeseries.
 	f(&options{
 		op:                    registerMetricNames,
 		path:                  "DifferentDates_RegisterMetricNames_SequentialBatches",
@@ -1410,6 +1405,9 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		concurrency:           1,
 		splitBatches:          false,
 		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
 	})
 	f(&options{
 		op:                    registerMetricNames,
@@ -1418,6 +1416,9 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		concurrency:           numBatches,
 		splitBatches:          true,
 		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
 	})
 	f(&options{
 		op:                    registerMetricNames,
@@ -1426,6 +1427,9 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		concurrency:           numBatches,
 		splitBatches:          false,
 		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
 	})
 
 	numBatches = 4
@@ -1487,6 +1491,9 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		concurrency:           1,
 		splitBatches:          false,
 		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
 	})
 	f(&options{
 		op:                    registerMetricNames,
@@ -1495,6 +1502,9 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		concurrency:           numBatches,
 		splitBatches:          true,
 		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
 	})
 	f(&options{
 		op:                    registerMetricNames,
@@ -1503,6 +1513,9 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		concurrency:           numBatches,
 		splitBatches:          false,
 		wantTimeseriesCreated: wantTimeseriesCreated,
+		timeRanges:            trs,
+		wantCounts:            wantCounts,
+		wantTotalSeries:       wantTotalSeries,
 	})
 
 }
