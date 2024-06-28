@@ -1305,7 +1305,9 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts            []int
 		wantTotalSeries       []*dateCount
 	}
-	f := func(opts *options) {
+	f := func(t *testing.T, opts *options) {
+		t.Helper()
+
 		var failed bool
 		path := fmt.Sprintf("%s_%s", t.Name(), opts.path)
 		s := MustOpenStorage(path, 0, 0, 0)
@@ -1365,7 +1367,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 	wantTimeseriesCreated := len(batches[len(batches)-1])
 	wantCounts = append(wantCounts, wantTimeseriesCreated)
 
-	f(&options{
+	f(t, &options{
 		op:                    addRows,
 		path:                  "DifferentDates_AddRows_SequentialBatches",
 		mrsBatches:            batches,
@@ -1376,7 +1378,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	f(&options{
+	f(t, &options{
 		op:                    addRows,
 		path:                  "DifferentDates_AddRows_SequentialBatchesConcurrentRows",
 		mrsBatches:            batches,
@@ -1387,7 +1389,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	f(&options{
+	f(t, &options{
 		op:                    addRows,
 		path:                  "DifferentDates_AddRows_ConcurrentBatches",
 		mrsBatches:            batches,
@@ -1398,7 +1400,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	f(&options{
+	f(t, &options{
 		op:                    registerMetricNames,
 		path:                  "DifferentDates_RegisterMetricNames_SequentialBatches",
 		mrsBatches:            batches,
@@ -1409,7 +1411,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	f(&options{
+	f(t, &options{
 		op:                    registerMetricNames,
 		path:                  "DifferentDates_RegisterMetricNames_SequentialBatchesConcurrentRows",
 		mrsBatches:            batches,
@@ -1420,7 +1422,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	f(&options{
+	f(t, &options{
 		op:                    registerMetricNames,
 		path:                  "DifferentDates_RegisterMetricNames_ConcurrentBatches",
 		mrsBatches:            batches,
@@ -1451,7 +1453,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 	wantTimeseriesCreated = len(batches[len(batches)-1])
 	wantCounts = append(wantCounts, wantTimeseriesCreated)
 
-	f(&options{
+	f(t, &options{
 		op:                    addRows,
 		path:                  "SameDate_AddRows_SequentialBatches",
 		mrsBatches:            batches,
@@ -1462,7 +1464,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	f(&options{
+	f(t, &options{
 		op:                    addRows,
 		path:                  "SameDate_AddRows_SequentialBatchesConcurrentRows",
 		mrsBatches:            batches,
@@ -1473,7 +1475,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	f(&options{
+	f(t, &options{
 		op:                    addRows,
 		path:                  "SameDate_AddRows_ConcurrentBatches",
 		mrsBatches:            batches,
@@ -1484,7 +1486,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	f(&options{
+	f(t, &options{
 		op:                    registerMetricNames,
 		path:                  "SameDate_RegisterMetricNames_SequentialBatches",
 		mrsBatches:            batches,
@@ -1495,7 +1497,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	f(&options{
+	f(t, &options{
 		op:                    registerMetricNames,
 		path:                  "SameDate_RegisterMetricNames_SequentialBatchesConcurrentRows",
 		mrsBatches:            batches,
@@ -1506,7 +1508,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-	f(&options{
+	f(t, &options{
 		op:                    registerMetricNames,
 		path:                  "SameDate_RegisterMetricNames_ConcurrentBatches",
 		mrsBatches:            batches,

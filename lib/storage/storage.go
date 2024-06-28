@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -2595,7 +2596,7 @@ type uniqueMetricIDCache struct {
 
 type metricIDWithDates struct {
 	metricID uint64
-	dates    map[uint64]bool
+	dates    []uint64
 }
 
 // newUniqueMetricIDCache creates a new MetricName -> (MetricID, set(Date))
@@ -2643,16 +2644,14 @@ func (c *uniqueMetricIDCache) getOrPut(metricName []byte, metricID, date uint64)
 		v, found = c.prev[string(metricName)]
 	}
 	if found {
-		hasDate := v.dates[date]
+		hasDate := slices.Contains(v.dates, date)
 		if !hasDate {
-			v.dates[date] = true
+			v.dates = append(v.dates, date)
 		}
 		return v.metricID, hasDate
 	}
 
-	dates := make(map[uint64]bool)
-	dates[date] = true
-	c.curr[string(metricName)] = &metricIDWithDates{metricID, dates}
+	c.curr[string(metricName)] = &metricIDWithDates{metricID, []uint64{date}}
 	return metricID, false
 }
 
