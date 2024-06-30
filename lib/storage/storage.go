@@ -41,8 +41,13 @@ const (
 
 // Storage represents TSDB storage.
 type Storage struct {
-	tooSmallTimestampRows atomic.Uint64
-	tooBigTimestampRows   atomic.Uint64
+	rowsReceivedTotal         atomic.Uint64
+	rowsAddedTotal            atomic.Uint64
+	naNValueRows              atomic.Uint64
+	staleNaNValueRows         atomic.Uint64
+	tooSmallTimestampRows     atomic.Uint64
+	tooBigTimestampRows       atomic.Uint64
+	unmarshallableMetricNames atomic.Uint64
 
 	timeseriesRepopulated  atomic.Uint64
 	timeseriesPreCreated   atomic.Uint64
@@ -484,12 +489,16 @@ func (s *Storage) idb() *indexDB {
 
 // Metrics contains essential metrics for the Storage.
 type Metrics struct {
+	RowsReceivedTotal uint64
 	RowsAddedTotal    uint64
 	DedupsDuringMerge uint64
 	SnapshotsCount    uint64
 
-	TooSmallTimestampRows uint64
-	TooBigTimestampRows   uint64
+	NaNValueRows              uint64
+	StaleNanValueRows         uint64
+	TooSmallTimestampRows     uint64
+	TooBigTimestampRows       uint64
+	UnmarshallableMetricNames uint64
 
 	TimeseriesRepopulated  uint64
 	TimeseriesPreCreated   uint64
@@ -557,12 +566,16 @@ func (m *Metrics) Reset() {
 
 // UpdateMetrics updates m with metrics from s.
 func (s *Storage) UpdateMetrics(m *Metrics) {
-	m.RowsAddedTotal = rowsAddedTotal.Load()
+	m.RowsReceivedTotal = s.rowsReceivedTotal.Load()
+	m.RowsAddedTotal = s.rowsAddedTotal.Load()
 	m.DedupsDuringMerge = dedupsDuringMerge.Load()
 	m.SnapshotsCount += uint64(s.mustGetSnapshotsCount())
 
+	m.NaNValueRows += s.naNValueRows.Load()
+	m.StaleNanValueRows += s.staleNaNValueRows.Load()
 	m.TooSmallTimestampRows += s.tooSmallTimestampRows.Load()
 	m.TooBigTimestampRows += s.tooBigTimestampRows.Load()
+	m.UnmarshallableMetricNames += s.unmarshallableMetricNames.Load()
 
 	m.TimeseriesRepopulated += s.timeseriesRepopulated.Load()
 	m.TimeseriesPreCreated += s.timeseriesPreCreated.Load()
@@ -1619,19 +1632,16 @@ func (s *Storage) ForceMergePartitions(partitionNamePrefix string) error {
 	return s.tb.ForceMergePartitions(partitionNamePrefix)
 }
 
-var rowsAddedTotal atomic.Uint64
-
 // AddRows adds the given mrs to s.
 //
 // The caller should limit the number of concurrent AddRows calls to the number
 // of available CPU cores in order to limit memory usage.
-func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) error {
+func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) {
 	if len(mrs) == 0 {
-		return nil
+		return
 	}
 
 	// Add rows to the storage in blocks with limited size in order to reduce memory usage.
-	var firstErr error
 	ic := getMetricRowsInsertCtx()
 	maxBlockLen := len(ic.rrs)
 	for len(mrs) > 0 {
@@ -1642,17 +1652,16 @@ func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) error {
 		} else {
 			mrs = nil
 		}
-		if err := s.add(ic.rrs, ic.tmpMrs, mrsBlock, precisionBits); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		rowsAddedTotal.Add(uint64(len(mrsBlock)))
+		rowsAdded := s.add(ic.rrs, ic.tmpMrs, mrsBlock, precisionBits)
+
+		// If the number of received rows is greater than the number of added
+		// rows, then some rows have failed to add. Check logs for the first
+		// error.
+		s.rowsAddedTotal.Add(uint64(rowsAdded))
+		s.rowsReceivedTotal.Add(uint64(len(mrsBlock)))
+
 	}
 	putMetricRowsInsertCtx(ic)
-
-	return firstErr
 }
 
 type metricRowsInsertCtx struct {
@@ -1802,7 +1811,7 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 	}
 }
 
-func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, precisionBits uint8) error {
+func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, precisionBits uint8) int {
 	idb := s.idb()
 	generation := idb.generation
 	is := idb.getIndexSearch(noDeadline)
@@ -1837,6 +1846,7 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 			if !decimal.IsStaleNaN(mr.Value) {
 				// Skip NaNs other than Prometheus staleness marker, since the underlying encoding
 				// doesn't know how to work with them.
+				s.naNValueRows.Add(1)
 				continue
 			}
 			isStaleNan = true
@@ -1891,15 +1901,18 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 			prevTSID = r.TSID
 			prevMetricNameRaw = mr.MetricNameRaw
 
+			metricID := genTSID.TSID.MetricID
+			date := uint64(r.Timestamp) / msecPerDay
+
 			if genTSID.generation < generation {
 				// The found TSID is from the previous indexdb. Create it in the current indexdb.
-				date := uint64(r.Timestamp) / msecPerDay
 
 				if err := mn.UnmarshalRaw(mr.MetricNameRaw); err != nil {
 					if firstWarn == nil {
 						firstWarn = fmt.Errorf("cannot unmarshal MetricNameRaw %q: %w", mr.MetricNameRaw, err)
 					}
 					j--
+					s.unmarshallableMetricNames.Add(1)
 					continue
 				}
 				mn.sortTags()
@@ -1909,6 +1922,20 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 				s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
 				seriesRepopulated++
 				slowInsertsCount++
+			} else if !s.dateMetricIDCache.Has(generation, date, metricID) && !is.hasDateMetricIDNoExtDB(date, metricID) {
+				if err := mn.UnmarshalRaw(mr.MetricNameRaw); err != nil {
+					// Do not stop adding rows on error - just skip invalid row.
+					// This guarantees that invalid rows don't prevent
+					// from adding valid rows into the storage.
+					if firstWarn == nil {
+						firstWarn = fmt.Errorf("cannot umarshal MetricNameRaw %q: %w", mr.MetricNameRaw, err)
+					}
+					continue
+				}
+				mn.sortTags()
+
+				is.createPerDayIndexes(date, &genTSID.TSID, mn)
+				s.dateMetricIDCache.Set(generation, date, metricID)
 			}
 			continue
 		}
@@ -1957,6 +1984,7 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 		// then we skip it. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/5069
 		if isStaleNan {
 			j--
+			s.staleNaNValueRows.Add(1)
 			continue
 		}
 
@@ -1981,23 +2009,21 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 
 	if err := s.prefillNextIndexDB(rows, dstMrs); err != nil {
 		if firstWarn == nil {
-			firstWarn = err
+			firstWarn = fmt.Errorf("warn occurred while prefilling next indexdb: %w", err)
 		}
 	}
+	if err := s.updatePerDateData(rows, dstMrs); err != nil {
+		if firstWarn == nil {
+			firstWarn = fmt.Errorf("warn occurred while prefilling next day index: %w", err)
+		}
+	}
+
 	if firstWarn != nil {
 		storageAddRowsLogger.Warnf("warn occurred during rows addition: %s", firstWarn)
 	}
 
-	err := s.updatePerDateData(rows, dstMrs)
-	if err != nil {
-		err = fmt.Errorf("cannot update per-date data: %w", err)
-	} else {
-		s.tb.MustAddRows(rows)
-	}
-	if err != nil {
-		return fmt.Errorf("error occurred during rows addition: %w", err)
-	}
-	return nil
+	s.tb.MustAddRows(rows)
+	return len(rows)
 }
 
 func (s *Storage) generateUniqueTSID(genTSID *generationTSID, mn *MetricName, mr *MetricRow, is *indexSearch, generation, date uint64, newSeriesCount *uint64) bool {

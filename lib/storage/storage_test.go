@@ -2,12 +2,12 @@ package storage
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strings"
 	"sync"
 	"testing"
 	"testing/quick"
@@ -571,12 +571,7 @@ func testStorageRandTimestamps(s *Storage) error {
 			}
 			mrs = append(mrs, mr)
 		}
-		if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
-			errStr := err.Error()
-			if !strings.Contains(errStr, "too big timestamp") && !strings.Contains(errStr, "too small timestamp") {
-				return fmt.Errorf("unexpected error when adding mrs: %w", err)
-			}
-		}
+		s.AddRows(mrs, defaultPrecisionBits)
 	}
 
 	// Verify the storage contains rows.
@@ -692,9 +687,7 @@ func testStorageDeleteSeries(s *Storage, workerNum int) error {
 			}
 			mrs = append(mrs, mr)
 		}
-		if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
-			return fmt.Errorf("unexpected error when adding mrs: %w", err)
-		}
+		s.AddRows(mrs, defaultPrecisionBits)
 	}
 	s.DebugFlush()
 
@@ -1032,9 +1025,7 @@ func testStorageAddRows(rng *rand.Rand, s *Storage) error {
 	minTimestamp := maxTimestamp - s.retentionMsecs + 3600*1000
 	for i := 0; i < addsCount; i++ {
 		mrs := testGenerateMetricRows(rng, rowsPerAdd, minTimestamp, maxTimestamp)
-		if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
-			return fmt.Errorf("unexpected error when adding mrs: %w", err)
-		}
+		s.AddRows(mrs, defaultPrecisionBits)
 	}
 
 	// Verify the storage contains rows.
@@ -1106,6 +1097,220 @@ func testStorageAddRows(rng *rand.Rand, s *Storage) error {
 	return nil
 }
 
+func TestStorageRowsNotAdded(t *testing.T) {
+	type options struct {
+		name            string
+		retention       time.Duration
+		maxHourlySeries int
+		maxDailySeries  int
+		mrs             []MetricRow
+		wantMetrics     *Metrics
+		tr              *TimeRange
+		wantCount       int
+	}
+	f := func(t *testing.T, opts *options) {
+		t.Helper()
+
+		var failed bool
+		var gotMetrics Metrics
+		path := fmt.Sprintf("%s_%s", t.Name(), opts.name)
+		s := MustOpenStorage(path, opts.retention, opts.maxHourlySeries, opts.maxDailySeries)
+		s.AddRows(opts.mrs, defaultPrecisionBits)
+		s.DebugFlush()
+		s.UpdateMetrics(&gotMetrics)
+
+		if got, want := gotMetrics.RowsReceivedTotal, opts.wantMetrics.RowsReceivedTotal; got != want {
+			t.Errorf("unexpected RowsReceivedTotal: got %d, want %d", got, want)
+			failed = true
+		}
+		if got, want := gotMetrics.RowsAddedTotal, opts.wantMetrics.RowsAddedTotal; got != want {
+			t.Errorf("unexpected RowsAddedTotal: got %d, want %d", got, want)
+			failed = true
+		}
+		if got, want := gotMetrics.TooSmallTimestampRows, opts.wantMetrics.TooSmallTimestampRows; got != want {
+			t.Errorf("unexpected TooSmallTimestampRows: got %d, want %d", got, want)
+			failed = true
+		}
+		if got, want := gotMetrics.TooBigTimestampRows, opts.wantMetrics.TooBigTimestampRows; got != want {
+			t.Errorf("unexpected TooBigTimestampRows: got %d, want %d", got, want)
+			failed = true
+		}
+
+		gotNameCount, gotIDCount := testCountAllMetricNamesAndIDs(s, *opts.tr)
+		want := opts.wantCount
+		if gotNameCount != want || gotIDCount != want {
+			t.Errorf("unexpected metric name or ID count: got (%d, %d), want (%d, %d)", gotNameCount, gotIDCount, want, want)
+		}
+
+		s.MustClose()
+
+		if !failed {
+			fs.MustRemoveAll(path)
+		}
+	}
+
+	const numRows = 1000
+	var (
+		rng          = rand.New(rand.NewSource(1))
+		retention    time.Duration
+		minTimestamp int64
+		maxTimestamp int64
+		mrs          []MetricRow
+	)
+
+	minTimestamp = -1000
+	maxTimestamp = -1
+	f(t, &options{
+		name:      "NegativeTimestamps",
+		retention: retentionMax,
+		mrs:       testGenerateMetricRows(rng, numRows, minTimestamp, maxTimestamp),
+		wantMetrics: &Metrics{
+			RowsReceivedTotal:     numRows,
+			RowsAddedTotal:        0,
+			TooSmallTimestampRows: numRows,
+		},
+		tr:        &TimeRange{minTimestamp, maxTimestamp},
+		wantCount: 0,
+	})
+
+	retention = 48 * time.Hour
+	minTimestamp = time.Now().Add(-retention - time.Hour).UnixMilli()
+	maxTimestamp = minTimestamp + 1000
+	f(t, &options{
+		name:      "TooSmallTimestamps",
+		retention: retention,
+		mrs:       testGenerateMetricRows(rng, numRows, minTimestamp, maxTimestamp),
+		wantMetrics: &Metrics{
+			RowsReceivedTotal:     numRows,
+			RowsAddedTotal:        0,
+			TooSmallTimestampRows: numRows,
+		},
+		tr:        &TimeRange{minTimestamp, maxTimestamp},
+		wantCount: 0,
+	})
+
+	retention = 48 * time.Hour
+	minTimestamp = time.Now().Add(7 * 24 * time.Hour).UnixMilli()
+	maxTimestamp = minTimestamp + 1000
+	f(t, &options{
+		name:      "TooBigTimestamps",
+		retention: retention,
+		mrs:       testGenerateMetricRows(rng, numRows, minTimestamp, maxTimestamp),
+		wantMetrics: &Metrics{
+			RowsReceivedTotal:   numRows,
+			RowsAddedTotal:      0,
+			TooBigTimestampRows: numRows,
+		},
+		tr:        &TimeRange{minTimestamp, maxTimestamp},
+		wantCount: 0,
+	})
+
+	minTimestamp = time.Now().UnixMilli()
+	maxTimestamp = minTimestamp + 1000
+	mrs = testGenerateMetricRows(rng, numRows, minTimestamp, maxTimestamp)
+	for i := range numRows {
+		mrs[i].Value = math.NaN()
+	}
+	f(t, &options{
+		name: "NaN",
+		mrs:  mrs,
+		wantMetrics: &Metrics{
+			RowsReceivedTotal: numRows,
+			RowsAddedTotal:    0,
+		},
+		tr:        &TimeRange{minTimestamp, maxTimestamp},
+		wantCount: 0,
+	})
+
+	minTimestamp = time.Now().UnixMilli()
+	maxTimestamp = minTimestamp + 1000
+	mrs = testGenerateMetricRows(rng, numRows, minTimestamp, maxTimestamp)
+	for i := range numRows {
+		mrs[i].Value = decimal.StaleNaN
+	}
+	f(t, &options{
+		name: "StaleNaN",
+		mrs:  mrs,
+		wantMetrics: &Metrics{
+			RowsReceivedTotal: numRows,
+			RowsAddedTotal:    0,
+		},
+		tr:        &TimeRange{minTimestamp, maxTimestamp},
+		wantCount: 0,
+	})
+
+	minTimestamp = time.Now().UnixMilli()
+	maxTimestamp = minTimestamp + 1000
+	mrs = testGenerateMetricRows(rng, numRows, minTimestamp, maxTimestamp)
+	for i := range numRows {
+		mrs[i].MetricNameRaw = []byte("garbage")
+	}
+	f(t, &options{
+		name: "InvalidMetricNameRaw",
+		mrs:  mrs,
+		wantMetrics: &Metrics{
+			RowsReceivedTotal: numRows,
+			RowsAddedTotal:    0,
+		},
+		tr:        &TimeRange{minTimestamp, maxTimestamp},
+		wantCount: 0,
+	})
+}
+
+func TestStorageRowsNotAdded_SeriesLimitExceeded(t *testing.T) {
+	f := func(t *testing.T, name string, maxHourlySeries int, maxDailySeries int) {
+		t.Helper()
+
+		var failed bool
+
+		rng := rand.New(rand.NewSource(1))
+		numRows := uint64(1000)
+		minTimestamp := time.Now().UnixMilli()
+		maxTimestamp := minTimestamp + 1000
+		mrs := testGenerateMetricRows(rng, numRows, minTimestamp, maxTimestamp)
+
+		var got Metrics
+		path := fmt.Sprintf("%s_%s", t.Name(), name)
+		s := MustOpenStorage(path, 0, maxHourlySeries, maxDailySeries)
+		s.AddRows(mrs, defaultPrecisionBits)
+		s.DebugFlush()
+		s.UpdateMetrics(&got)
+
+		if got, want := got.RowsReceivedTotal, numRows; got != want {
+			t.Errorf("unexpected RowsReceivedTotal: got %d, want %d", got, want)
+			failed = true
+		}
+		want := got.RowsReceivedTotal - (got.HourlySeriesLimitRowsDropped + got.DailySeriesLimitRowsDropped)
+		if got.RowsAddedTotal != want {
+			t.Errorf("RowsAddedTotal(%d) != RowsReceivedTotal(%d) - (HourlySeriesLimitRowsDropped(%d) + DailySeriesLimitRowsDropped(%d))", []any{
+				got.RowsAddedTotal,
+				got.RowsReceivedTotal,
+				got.HourlySeriesLimitRowsDropped,
+				got.DailySeriesLimitRowsDropped}...)
+			failed = true
+		}
+
+		gotNameCount, gotIDCount := testCountAllMetricNamesAndIDs(s, TimeRange{minTimestamp, maxTimestamp})
+		if gotNameCount != int(want) || gotIDCount != int(want) {
+			t.Errorf("unexpected metric name or ID count: got (%d, %d), want (%d, %d)", gotNameCount, gotIDCount, want, want)
+		}
+
+		s.MustClose()
+
+		if !failed {
+			fs.MustRemoveAll(path)
+		}
+	}
+
+	maxHourlySeries := 1
+	maxDailySeries := 0 // No limit
+	f(t, "HourlyLimitExceeded", maxHourlySeries, maxDailySeries)
+
+	maxHourlySeries = 0 // No limit
+	maxDailySeries = 1
+	f(t, "DailyLimitExceeded", maxHourlySeries, maxDailySeries)
+}
+
 func TestStorageRotateIndexDB(t *testing.T) {
 	path := "TestStorageRotateIndexDB"
 	s := MustOpenStorage(path, 0, 0, 0)
@@ -1173,9 +1378,7 @@ func testStorageAddMetrics(s *Storage, workerNum int) error {
 			Timestamp:     timestamp,
 			Value:         value,
 		}
-		if err := s.AddRows([]MetricRow{mr}, defaultPrecisionBits); err != nil {
-			return fmt.Errorf("unexpected error when adding mrs: %w", err)
-		}
+		s.AddRows([]MetricRow{mr}, defaultPrecisionBits)
 	}
 
 	// Verify the storage contains rows.
@@ -1199,9 +1402,7 @@ func TestStorageDeleteStaleSnapshots(t *testing.T) {
 	minTimestamp := maxTimestamp - s.retentionMsecs
 	for i := 0; i < addsCount; i++ {
 		mrs := testGenerateMetricRows(rng, rowsPerAdd, minTimestamp, maxTimestamp)
-		if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
-			t.Fatalf("unexpected error when adding mrs: %s", err)
-		}
+		s.AddRows(mrs, defaultPrecisionBits)
 	}
 	// Try creating a snapshot from the storage.
 	snapshotName, err := s.CreateSnapshot()
@@ -1269,9 +1470,7 @@ func TestStorageSeriesAreNotCreatedOnStaleMarkers(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	mrs := testGenerateMetricRows(rng, 20, tr.MinTimestamp, tr.MaxTimestamp)
 	// populate storage with some rows
-	if err := s.AddRows(mrs[:10], defaultPrecisionBits); err != nil {
-		t.Fatal("error when adding mrs: %w", err)
-	}
+	s.AddRows(mrs[:10], defaultPrecisionBits)
 	s.DebugFlush()
 
 	// verify ingested rows are searchable
@@ -1290,9 +1489,7 @@ func TestStorageSeriesAreNotCreatedOnStaleMarkers(t *testing.T) {
 	for i := 0; i < len(mrs); i = i + 2 {
 		mrs[i].Value = decimal.StaleNaN
 	}
-	if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
-		t.Fatal("error when adding mrs: %w", err)
-	}
+	s.AddRows(mrs, defaultPrecisionBits)
 	s.DebugFlush()
 
 	// verify that rows marked as stale aren't searchable
@@ -1309,9 +1506,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		s.RegisterMetricNames(nil, mrs)
 	}
 	addRows := func(s *Storage, mrs []MetricRow) {
-		if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
-			panic(fmt.Sprintf("AddRows() failed unexpectedly: %v", err))
-		}
+		s.AddRows(mrs, defaultPrecisionBits)
 	}
 
 	type dateCount struct {
@@ -1324,6 +1519,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		mrsBatches            [][]MetricRow
 		concurrency           int
 		splitBatches          bool
+		wantRowsTotal         int
 		wantTimeseriesCreated int
 		timeRanges            []TimeRange
 		wantCounts            []int
@@ -1340,8 +1536,16 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 
 		s.DebugFlush()
 
+		if got, want := s.rowsReceivedTotal.Load(), uint64(opts.wantRowsTotal); got != want {
+			t.Errorf("%s: unexpected s.rowsReceivedTotal: got %d, want %d", opts.path, got, want)
+			failed = true
+		}
+		if got, want := s.rowsAddedTotal.Load(), uint64(opts.wantRowsTotal); got != want {
+			t.Errorf("%s: unexpected s.rowsAddedTotal: got %d, want %d", opts.path, got, want)
+			failed = true
+		}
 		if got, want := s.newTimeseriesCreated.Load(), uint64(opts.wantTimeseriesCreated); got != want {
-			t.Errorf("%s: unexpected s.newTimeseriesCreated value: got %d, want %d", opts.path, got, want)
+			t.Errorf("%s: unexpected s.newTimeseriesCreated: got %d, want %d", opts.path, got, want)
 			failed = true
 		}
 
@@ -1377,11 +1581,13 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 	trs := make([]TimeRange, numBatches)
 	wantCounts := make([]int, numBatches)
 	wantTotalSeries := make([]*dateCount, numBatches)
+	wantRowsTotal := 0
 	rng := rand.New(rand.NewSource(1))
 	for i := range numBatches {
 		minTimestamp := time.Date(2024, 1, i+1, 0, 0, 0, 0, time.UTC).UnixMilli()
 		maxTimestamp := time.Date(2024, 1, i+1, 23, 59, 59, 999, time.UTC).UnixMilli()
 		numTimeseries := (i + 1) * 100
+		wantRowsTotal += numTimeseries
 		batches[i] = testGenerateMetricRows(rng, uint64(numTimeseries), minTimestamp, maxTimestamp)
 		trs[i] = TimeRange{minTimestamp, maxTimestamp}
 		wantCounts[i] = numTimeseries
@@ -1397,6 +1603,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		mrsBatches:            batches,
 		concurrency:           1,
 		splitBatches:          false,
+		wantRowsTotal:         wantRowsTotal,
 		wantTimeseriesCreated: wantTimeseriesCreated,
 		timeRanges:            trs,
 		wantCounts:            wantCounts,
@@ -1408,6 +1615,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		mrsBatches:            batches,
 		concurrency:           numBatches,
 		splitBatches:          true,
+		wantRowsTotal:         wantRowsTotal,
 		wantTimeseriesCreated: wantTimeseriesCreated,
 		timeRanges:            trs,
 		wantCounts:            wantCounts,
@@ -1419,6 +1627,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		mrsBatches:            batches,
 		concurrency:           numBatches,
 		splitBatches:          false,
+		wantRowsTotal:         wantRowsTotal,
 		wantTimeseriesCreated: wantTimeseriesCreated,
 		timeRanges:            trs,
 		wantCounts:            wantCounts,
@@ -1463,11 +1672,13 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 	trs = make([]TimeRange, numBatches)
 	wantCounts = make([]int, numBatches)
 	wantTotalSeries = make([]*dateCount, numBatches)
+	wantRowsTotal = 0
 	rng = rand.New(rand.NewSource(1))
 	for i := range numBatches {
 		minTimestamp := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
 		maxTimestamp := time.Date(2024, 1, 1, 23, 59, 59, 999, time.UTC).UnixMilli()
 		numTimeseries := 100
+		wantRowsTotal += numTimeseries
 		batches[i] = testGenerateMetricRows(rng, uint64(numTimeseries), minTimestamp, maxTimestamp)
 		trs[i] = TimeRange{minTimestamp, maxTimestamp}
 		wantCounts[i] = numTimeseries
@@ -1483,6 +1694,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		mrsBatches:            batches,
 		concurrency:           1,
 		splitBatches:          false,
+		wantRowsTotal:         wantRowsTotal,
 		wantTimeseriesCreated: wantTimeseriesCreated,
 		timeRanges:            trs,
 		wantCounts:            wantCounts,
@@ -1494,6 +1706,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		mrsBatches:            batches,
 		concurrency:           numBatches,
 		splitBatches:          true,
+		wantRowsTotal:         wantRowsTotal,
 		wantTimeseriesCreated: wantTimeseriesCreated,
 		timeRanges:            trs,
 		wantCounts:            wantCounts,
@@ -1505,6 +1718,7 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		mrsBatches:            batches,
 		concurrency:           numBatches,
 		splitBatches:          false,
+		wantRowsTotal:         wantRowsTotal,
 		wantTimeseriesCreated: wantTimeseriesCreated,
 		timeRanges:            trs,
 		wantCounts:            wantCounts,
@@ -1543,7 +1757,6 @@ func TestEachTimeSeriesHasOneUniqueMetricID(t *testing.T) {
 		wantCounts:            wantCounts,
 		wantTotalSeries:       wantTotalSeries,
 	})
-
 }
 
 // testDoConcurrently is a test helper function that performs some operation on

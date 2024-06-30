@@ -49,9 +49,7 @@ func benchmarkStorageAddRows(b *testing.B, rowsPerBatch int) {
 				mr.Timestamp = int64(offset + i)
 				mr.Value = float64(offset + i)
 			}
-			if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
-				panic(fmt.Errorf("cannot add rows to storage: %w", err))
-			}
+			s.AddRows(mrs, defaultPrecisionBits)
 		}
 	})
 	b.StopTimer()
@@ -71,9 +69,7 @@ func BenchmarkStorageAddHistoricalRowsConcurrently(b *testing.B) {
 	tr := TimeRange{int64(0), int64(numBatches * numRowsPerBatch)}
 
 	addRows := func(s *Storage, mrs []MetricRow) {
-		if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
-			panic(fmt.Sprintf("AddRows() failed unexpectedly: %v", err))
-		}
+		s.AddRows(mrs, defaultPrecisionBits)
 	}
 
 	for _, concurrency := range []int{1, 2, 4, 8, 16, 32} {
