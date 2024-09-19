@@ -413,8 +413,6 @@ func invalidateTagFiltersCache() {
 var tagFiltersKeyGen uint64
 
 func marshalMetricIDs(dst []byte, metricIDs []uint64) []byte {
-	// Compress metricIDs, so they occupy less space in the cache.
-	//
 	// The srcBuf is a []byte cast of metricIDs.
 	var srcBuf []byte
 	if len(metricIDs) > 0 {
@@ -423,14 +421,20 @@ func marshalMetricIDs(dst []byte, metricIDs []uint64) []byte {
 		sh.Cap = 8 * len(metricIDs)
 		sh.Len = 8 * len(metricIDs)
 	}
-
-	dst = encoding.CompressZSTDLevel(dst, srcBuf, 1)
-	return dst
+	return append(dst, srcBuf...)
 }
 
 func mustUnmarshalMetricIDs(dst []uint64, src []byte) []uint64 {
-	// Decompress src into dstBuf.
-	//
+	if len(src) == 0 {
+		return dst
+	}
+	if len(src)%8 != 0 {
+		logger.Panicf("cannot unmarshal metricIDs from buffer of %d bytes; the buffer length must divide by 8", len(src))
+	}
+	if len(src) < 8 {
+		logger.Panicf("cannot unmarshal metricIDs len from buffer of %d bytes; need at least 8 bytes", len(src))
+	}
+
 	// dstBuf is a []byte cast of dst.
 	var dstBuf []byte
 	if len(dst) > 0 {
@@ -439,19 +443,8 @@ func mustUnmarshalMetricIDs(dst []uint64, src []byte) []uint64 {
 		sh.Cap = 8 * cap(dst)
 		sh.Len = 8 * len(dst)
 	}
-	dstBufLen := len(dstBuf)
-	var err error
-	dstBuf, err = encoding.DecompressZSTD(dstBuf, src)
-	if err != nil {
-		logger.Panicf("FATAL: cannot decompress metricIDs: %s", err)
-	}
-	if len(dstBuf) == dstBufLen {
-		// Zero metricIDs
-		return dst
-	}
-	if (len(dstBuf)-dstBufLen)%8 != 0 {
-		logger.Panicf("FATAL: cannot unmarshal metricIDs from buffer of %d bytes; the buffer length must divide by 8", len(dstBuf)-dstBufLen)
-	}
+
+	dstBuf = append(dstBuf, src...)
 
 	// Convert dstBuf back to dst
 	sh := (*reflect.SliceHeader)(unsafe.Pointer(&dst))
